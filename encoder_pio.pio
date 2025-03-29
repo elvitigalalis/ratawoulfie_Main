@@ -1,0 +1,105 @@
+.program EncoderTicks
+.origin 0 
+
+; Jump table:
+    ;state 00
+    JMP stop    ; 0000
+    JMP reverse ; 0001
+    JMP forward ; 0010
+    JMP stop    ; 0011
+
+    ;state 01
+    JMP forward ; 0100
+    JMP stop    ; 0101
+    JMP stop    ; 0110
+    JMP reverse ; 0111
+
+    ;state 10
+    JMP reverse ; 1000
+    JMP stop    ; 1001
+    JMP stop    ; 1010
+    JMP forward ; 1011
+
+    ;state 11
+    JMP stop    ; 1100
+    JMP forward ; 1101
+
+    reverse:    ; serves also as state 1110
+    JMP Y--, stop;
+
+.wrap_target
+    ; this pushes the data and processes it
+    stop:       ; serves also as state 1111
+    MOV ISR, Y  
+    PUSH noblock ; sends our current counter to microcontroller (Y->ISR->RX FIFO)
+
+    ; samples two pins for the state 
+    sample_pins:
+    OUT ISR, 2 ; moves old 2 bit state from OSR to ISR
+    IN PINS, 2 ; reads new 2 bit state from pins into ISR
+
+    MOV OSR, ISR ; copies our 4 bit state into OSR for next 
+    MOV PC, ISR ; this line jumps to the corresponding state
+
+    forward:
+    MOV Y, ~Y ; negate Y REGISTER
+    JMP Y--, forward_cont ; decrement negative value
+    forward_cont:
+    MOV Y, ~Y ; negate to make positive (incremented)
+.wrap
+
+;OUR ENCODER TICKS ARE COUNTED IN THE Y REGISTER 
+
+; speed?
+
+% c-sdk {
+
+    #include "hardware/clocks.h"
+    #include "hardware/gpio.h"
+
+
+    // intialize PIO
+    static inline void quadrature_encoder_initialization(PIO pio, uint sm, uint pin, int max_step_rate) {
+        pio_sm_set_consecutive_pindirs(pio, sm, pin, 2, false);                     // initialize two pins (false = input)
+        pio_gpio_init(pio, pin);                                                    // initialize pio for first pin
+        pio_gpio_init(pio, pin + 1);                                                // initialzie pio for second pin
+
+        gpio_pull_up(pin);                                                          // pull up first pin 
+        gpio_pull_up(pin + 1);                                                      // pull up second pin
+
+        pio_sm_config config = EncoderTicks_program_get_default_config(0);    // make and get default configuration at program counter 0 
+
+        sm_config_set_in_pins(&config, pin);                                        // use configuration to initialize sme "in" command to pins we're using
+        sm_config_set_jmp_pin(&config, pin);                                        // use configuration to initialize sm "jmp" command to pins we're using
+
+        sm_config_set_in_shift(&config, false, false, 32);                          // set up how shifting in works (autopull disabled (TX fifo pulls) off, and shift right false = shift left) 
+
+        sm_config_set_fifo_join(&config, PIO_FIFO_JOIN_NONE);                       // set up to decline fifo join
+
+        if (max_step_rate == 0) {                          
+            sm_config_set_clkdiv(&config, 1.0);                                     // if max_step_rate = 0 then state machine clock = system clock
+        } else {
+            float div = (float)clock_get_hz(clk_sys) / (10 * max_step_rate);
+            sm_config_set_clkdiv(&config, div);
+        }
+
+        pio_sm_init(pio, sm, 0, &config);                                          // loads config and program onto sm
+        pio_sm_set_enabled(pio, sm, true);                                         // enable sm machine
+
+    }
+
+    // get count from PIO
+    static inline int32_t quadrature_encoder_get_count(PIO pio, uint sm) {
+        uint ret;
+        int n;
+
+        n = pio_sm_get_rx_fifo_level(pio, sm) + 1;                                 // read how many elements in fifo, + 1 for most updated
+        while (n > 0) {                                                            // read elements from fifo
+            ret = pio_sm_get_blocking(pio, sm);
+            n--;
+        }
+        return ret;
+    }
+
+
+%}
