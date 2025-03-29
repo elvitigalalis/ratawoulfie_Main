@@ -1,91 +1,114 @@
+/**
+ * @file Motor.h
+ * @brief Motor control class with PID control for use with the PIO encoder
+ */
+
+#ifndef MOTOR_H
+#define MOTOR_H
+
 #include "encoder.h"
 #include "hardware/gpio.h"
-#include "hardware/irq.h"
-#include "hardware/pio.h"
 #include "hardware/pwm.h"
 #include "pico/stdlib.h"
-#include <iostream>
-#include <string>
-
-// PID Constants
-#define RIGHTMOTORKP 10
-#define RIGHTMOTORKI 23 // 20 is better for 5V
-#define LEFTMOTORKP 7.75
-#define LEFTMOTORKI 20
-
-// Pins
-// 6, 7, 8, 9
-// 18, 19, 20, 21
+#include <stdint.h>
 
 class Motor {
-private:
-  // Motor pins
-  int H_BRIDGE_PIN_1;
-  int H_BRIDGE_PIN_2;
-  int ENCODER_PIN_1;
-  int ENCODER_PIN_2;
-  float MOTOR_CEPR; // Countable events per revolution, used for RPM
-                    // calculations and dependent on motor used
+public:
+  /**
+   * @brief Construct a new Motor object with PIO encoder
+   *
+   * @param motorPin1 First H-bridge control pin (PWM)
+   * @param motorPin2 Second H-bridge control pin (PWM)
+   * @param encoder_instance Pointer to an Encoder instance
+   * @param counts_per_rev Number of encoder counts per motor revolution
+   */
+  Motor(uint motorPin1, uint motorPin2, Encoder *encoder_instance,
+        uint counts_per_rev = 360);
 
-  // See initializePWM()
+  /**
+   * @brief Set target RPM for the motor
+   *
+   * @param rpm Desired RPM (negative for reverse)
+   */
+  void setRPM(float rpm);
+
+  /**
+   * @brief Stop the motor
+   */
+  void stop();
+
+  /**
+   * @brief Get current motor position
+   *
+   * @return int32_t Current position in encoder counts
+   */
+  int32_t getPosition();
+
+  /**
+   * @brief Get current motor RPM
+   *
+   * @return float Current RPM
+   */
+  float getRPM();
+
+  /**
+   * @brief Get target motor RPM
+   *
+   * @return float Target RPM
+   */
+  float getTargetRPM();
+
+  /**
+   * @brief Set PID control variables
+   *
+   * @param p Proportional gain
+   * @param i Integral gain
+   * @param d Derivative gain (optional)
+   * @param ff Feed-forward gain (optional)
+   */
+  void setPIDVariables(float p, float i, float d = 0.0f, float ff = 0.0f);
+
+  /**
+   * @brief Update motor PWM based on PID control
+   * This should be called periodically from a timer
+   */
+  void updatePWM();
+
+private:
+  // Hardware pins
+  uint H_BRIDGE_PIN_1;
+  uint H_BRIDGE_PIN_2;
+
+  // PWM configuration
   uint slice;
   uint channel1;
   uint channel2;
 
-  // Motor control
-  volatile float targetRPM = 0;
-  volatile int targetPosition;
+  // Encoder
+  Encoder *encoder;
+  uint MOTOR_CEPR; // Counts per revolution
 
   // Motor state
-  volatile int currentPosition = 0;
-  volatile float currentRPM = 0;
-  volatile bool motorOn = false;
+  float targetRPM;
+  float currentRPM;
+  int32_t currentPosition;
+  bool motorOn;
 
-  // PI variables
-  float kp = 0;
-  float ki = 0;
-  volatile float integral = 0;
+  // PID control variables
+  float kp;
+  float ki;
+  float kd;
+  float feedforward;
+  float integral;
+  float lastError;
   absolute_time_t lastPIDTime;
-
-  // PIO encoder variables
-  PIO pio;
-  uint sm;
-  int32_t last_encoder_count;
-  ;
-  absolute_time_t last_rpm_time;
 
   // Setup functions
   void setup();
   void initializePWM();
-  void initializeEncoder();
+
+  // Utility functions
   float abs(float num);
-
-public:
-  // Initialization commands
-  Motor(int motorPin1, int motorPin2, int encoderPinA, PIO pio_instance = pio0,
-        uint state_machine = 0);
-  void setPIDVariables(float Kp, float Ki) {
-    kp = Kp;
-    ki = Ki;
-  }
-  void start() { motorOn = true; }
-  void stop() {
-    motorOn = false;
-    pwm_set_both_levels(slice, 0, 0);
-  }
-  void setRPM(float rpm) {
-    targetRPM = rpm;
-    start();
-  }
-  void setPosition(int position) { targetPosition = position; }
-
-  // get commands
-  float getTargetRPM() { return targetRPM; }
-  float getRPM() { return currentRPM; }
-  int getTargetPosition() { return targetPosition; }
-  int getPosition() { return currentPosition; }
-
-  // Update functions
-  void updateEncoder();
-  void updatePWM();
 };
+
+#endif // MOTOR_H

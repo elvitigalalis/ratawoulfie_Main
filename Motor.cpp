@@ -1,171 +1,153 @@
+/**
+ * @file Motor.cpp
+ * @brief Implementation of the Motor class with PID control
+ */
+
 #include "Motor.h"
 
-Motor::Motor(int motorPin1, int motorPin2, int encoderPinA, PIO pio_instance,
-             uint state_machine) {
+// Helper function to clamp values
+template <typename T> T clamp(const T &value, const T &low, const T &high) {
+  return (value < low) ? low : ((value > high) ? high : value);
+}
+
+Motor::Motor(uint motorPin1, uint motorPin2, Encoder *encoder_instance,
+             uint counts_per_rev) {
   H_BRIDGE_PIN_1 = motorPin1;
   H_BRIDGE_PIN_2 = motorPin2;
-  ENCODER_PIN_1 = encoderPinA;
-  ENCODER_PIN_2 = encoderPinA + 1;
-  MOTOR_CEPR = 360; // For RPM calculations
-  pio = pio_instance;
-  sm = state_machine;
-  last_encoder_count = 0;
+  encoder = encoder_instance;
+  MOTOR_CEPR = counts_per_rev;
+
+  targetRPM = 0.0f;
+  currentRPM = 0.0f;
+  currentPosition = 0;
+  motorOn = false;
+
+  // Default PID values
+  kp = 0.5f;
+  ki = 0.2f;
+  kd = 0.0f;
+  feedforward = 0.0f;
+  integral = 0.0f;
+  lastError = 0.0f;
   lastPIDTime = get_absolute_time();
-  last_rpm_time = get_absolute_time();
 
   setup();
   initializePWM();
-  initializeEncoder();
 }
 
 void Motor::setup() {
+  // Configure motor driver pins for PWM
   gpio_set_function(H_BRIDGE_PIN_1, GPIO_FUNC_PWM);
   gpio_set_function(H_BRIDGE_PIN_2, GPIO_FUNC_PWM);
 }
 
 void Motor::initializePWM() {
-  /*
-      RP Pico has multiple PWM slices, each with two channels that
-      have the same configuration and wrap values but can have different
-      duty cycles.
-  */
+  // Get PWM slice and channels for the H-bridge pins
   channel1 = pwm_gpio_to_channel(H_BRIDGE_PIN_1);
   channel2 = pwm_gpio_to_channel(H_BRIDGE_PIN_2);
   slice = pwm_gpio_to_slice_num(H_BRIDGE_PIN_1);
+
+  // Configure PWM with default settings
   pwm_config config = pwm_get_default_config();
-  pwm_init(slice, &config, false);
-  pwm_set_wrap(slice, 999);
+
+  // Set wrap value for 1000 steps (0-999)
+  // With 125MHz system clock, this gives ~125kHz PWM frequency
+  pwm_config_set_wrap(&config, 999);
+
+  // Initialize PWM with stopped motor
+  pwm_init(slice, &config, true);
   pwm_set_both_levels(slice, 0, 0);
-  pwm_set_enabled(slice, true);
 }
 
-void Motor::initializeEncoder() {
-  // 50000 steps/second is max rate for encoder
-  quadrature_encoder_init(pio, sm, ENCODER_PIN_1, 50000);
-}
+float Motor::abs(float num) { return num < 0 ? -num : num; }
 
-float Motor::abs(float num) {
-  /*
-      For calculating absolute values since cmath isn't included
-      in the Motor file. This function could probably be deleted with
-      #include <cmath> moved to this file.
-  */
-  if (num < 0) {
-    return num * -1;
-  } else {
-    return num;
+void Motor::setRPM(float rpm) {
+  targetRPM = rpm;
+  motorOn = true;
+
+  // Reset integral when direction changes to avoid windup
+  if ((targetRPM > 0 && integral < 0) || (targetRPM < 0 && integral > 0)) {
+    integral = 0;
   }
 }
 
-void Motor::updateEncoder() {
-  int32_t new_count = quadrature_encoder_get_count(pio, sm);
+void Motor::stop() {
+  targetRPM = 0.0f;
+  motorOn = false;
+  integral = 0.0f;
 
-  // Change in position
-  int32_t delta = new_count - last_encoder_count;
-  last_encoder_count = new_count;
+  // Stop motor immediately
+  pwm_set_both_levels(slice, 0, 0);
+}
 
-  currentPosition = new_count;
+int32_t Motor::getPosition() { return encoder->getCount(); }
 
-  absolute_time_t current_time = get_absolute_time();
-  int64_t time_diff_us = absolute_time_diff_us(last_rpm_time, current_time);
+float Motor::getRPM() { return encoder->getRPM(MOTOR_CEPR); }
 
-  // Update RPM after 50ms minimum difference between last and current time
-  if (time_diff_us > 50000) {
-    currentRPM = (delta * 60000000.0f) / (MOTOR_CEPR * time_diff_us);
-    last_rpm_time = current_time;
-  }
+float Motor::getTargetRPM() { return targetRPM; }
 
-  if (time_diff_us > 500000 && delta == 0) {
-    currentRPM = 0;
-  }
+void Motor::setPIDVariables(float p, float i, float d, float ff) {
+  kp = p;
+  ki = i;
+  kd = d;
+  feedforward = ff;
 }
 
 void Motor::updatePWM() {
-  updateEncoder();
+  // Update encoder calculations
+  encoder->update();
+  currentRPM = encoder->getRPM(MOTOR_CEPR);
+  currentPosition = encoder->getCount();
 
+  // If motor is not enabled, don't update PWM
   if (!motorOn) {
     return;
   }
 
-  absolute_time_t pidCurrentTime = get_absolute_time();
-  // PI Control Loop for motor speed
+  // Calculate time since last update
+  absolute_time_t currentTime = get_absolute_time();
+  float deltaTime =
+      absolute_time_diff_us(lastPIDTime, currentTime) / 1000000.0f;
+
+  // PID control loop
   float error = abs(targetRPM) - abs(currentRPM);
-  integral += error * (absolute_time_diff_us(lastPIDTime, pidCurrentTime) /
-                       60000000.0f);
-  // Deadband
-  if (integral > 100) {
-    integral = 100;
+
+  // Integral term with anti-windup
+  integral += error * deltaTime;
+  integral = clamp(integral, -100.0f, 100.0f);
+
+  // Derivative term
+  float derivative = (error - lastError) / deltaTime;
+  lastError = error;
+
+  // Calculate feed-forward term (baseline PWM based on target RPM)
+  float ff = feedforward * abs(targetRPM);
+  if (ff == 0.0f) {
+    // Default feed-forward if not set (empirical: 300 + 0.7 * RPM)
+    ff = 300.0f + 0.7f * abs(targetRPM);
   }
 
-  // Calculate PWM with feedforward value
-  float feedForward = 537 + 0.8f * abs(targetRPM); // for vbatt of 7.6V
-  float pwm = kp * error + ki * integral + feedForward;
+  // Calculate final PWM value
+  float pwm = kp * error + ki * integral + kd * derivative + ff;
 
-  // Deadband
-  if (pwm > 999) {
-    pwm = 999;
-  }
+  // Limit PWM to valid range
+  pwm = clamp(pwm, 0.0f, 999.0f);
 
   // Set direction based on target RPM sign
-  if (targetRPM > 0) { // We should find a way to condense these if statements.
-    pwm_set_chan_level(slice, channel1, pwm);
+  if (targetRPM > 0) {
+    // Forward
+    pwm_set_chan_level(slice, channel1, (uint16_t)pwm);
     pwm_set_chan_level(slice, channel2, 0);
-  } else {
+  } else if (targetRPM < 0) {
+    // Reverse
     pwm_set_chan_level(slice, channel1, 0);
-    pwm_set_chan_level(slice, channel2, pwm);
+    pwm_set_chan_level(slice, channel2, (uint16_t)pwm);
+  } else {
+    // Stop
+    pwm_set_chan_level(slice, channel1, 0);
+    pwm_set_chan_level(slice, channel2, 0);
   }
 
-  lastPIDTime = pidCurrentTime;
+  // Update time for next calculation
+  lastPIDTime = currentTime;
 }
-
-// Test program
-/*
-Motor Motor1 = Motor(19, 18, 21, 20);
-
-bool controlLoop(repeating_timer_t *timer1){
-    Motor1.updatePWM();
-    return true;
-};
-
-void encoderInterrupt(uint gpio, uint32_t event_mask){
-    Motor1.encoderInterruptTime(gpio, event_mask);
-};
-
-bool clockInterrupt(repeating_timer_t *timer){
-    Motor1.clockInterruptTime();
-    return true;
-};
-
-int main(int argc, char* argv[]) {
-    stdio_init_all();
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, true);
-
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
-    sleep_ms(3000);
-    gpio_put(PICO_DEFAULT_LED_PIN, 0);
-
-    Motor1.setPIDVariables(RIGHTMOTORKP, RIGHTMOTORKI);
-
-    struct repeating_timer controlTimer;
-    add_repeating_timer_us(1000, controlLoop, NULL, &controlTimer);
-
-    struct repeating_timer encoderTimer;
-    add_repeating_timer_us(1000, clockInterrupt, NULL, &encoderTimer);
-
-
-    // gpio_set_irq_enabled(8, 0x8, true);
-    gpio_set_irq_enabled(21, 0x8, true);
-    gpio_set_irq_callback(encoderInterrupt);
-    irq_set_enabled(IO_IRQ_BANK0, true);
-
-    Motor1.setRPM(200);
-
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
-    while(true){
-        std::string thing = std::to_string(Motor1.getRPM()) + "\n";
-        // std::string thing = std::to_string(Motor1.getRPM()) + " " +
-std::to_string(Motor1.getTargetRPM()) + "\n"; printf(thing.c_str());
-    }
-};
-*/
