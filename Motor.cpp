@@ -1,26 +1,26 @@
 #include "Motor.h"
 
-Motor::Motor(int motorPin1, int motorPin2, int encoderPin1, int encoderPin2) {
+Motor::Motor(int motorPin1, int motorPin2, int encoderPinA, PIO pio_instance,
+             uint state_machine) {
   H_BRIDGE_PIN_1 = motorPin1;
   H_BRIDGE_PIN_2 = motorPin2;
-  ENCODER_PIN_1 = encoderPin1;
-  ENCODER_PIN_2 = encoderPin2;
-  MOTOR_CEPR = 360;                  // For calculating RPM
-  lastPIDTime = get_absolute_time(); // For calculating integral value
+  ENCODER_PIN_1 = encoderPinA;
+  ENCODER_PIN_2 = encoderPinA + 1;
+  MOTOR_CEPR = 360; // For RPM calculations
+  pio = pio_instance;
+  sm = state_machine;
+  last_encoder_count = 0;
+  lastPIDTime = get_absolute_time();
+  last_rpm_time = get_absolute_time();
+
   setup();
   initializePWM();
+  initializeEncoder();
 }
 
 void Motor::setup() {
   gpio_set_function(H_BRIDGE_PIN_1, GPIO_FUNC_PWM);
   gpio_set_function(H_BRIDGE_PIN_2, GPIO_FUNC_PWM);
-
-  gpio_set_input_enabled(ENCODER_PIN_1, true);
-  gpio_set_input_enabled(ENCODER_PIN_2, true);
-  gpio_set_dir(ENCODER_PIN_1, false);
-  gpio_set_dir(ENCODER_PIN_2, false);
-  gpio_pull_up(ENCODER_PIN_1);
-  gpio_pull_up(ENCODER_PIN_2);
 }
 
 void Motor::initializePWM() {
@@ -39,6 +39,11 @@ void Motor::initializePWM() {
   pwm_set_enabled(slice, true);
 }
 
+void Motor::initializeEncoder() {
+  // 50000 steps/second is max rate for encoder
+  quadrature_encoder_init(pio, sm, ENCODER_PIN_1, 50000);
+}
+
 float Motor::abs(float num) {
   /*
       For calculating absolute values since cmath isn't included
@@ -52,71 +57,65 @@ float Motor::abs(float num) {
   }
 }
 
-void Motor::encoderInterruptTime(uint gpio, uint32_t event_mask) {
-  /*
-      To be used in the GPIO interrupt callback for determining
-      the RPM of a motor. The RPM is averaged between the last three readings,
-      which is equivalent to calculating the RPM after one full revolution.
-  */
-  int currentDir = 0;
-  currentDir = gpio_get(ENCODER_PIN_2);
-  absolute_time_t currentTime = get_absolute_time();
-  int64_t dif = absolute_time_diff_us(lastTime, currentTime);
-  lastTime = currentTime;
-  difs[vindex++] = dif;
-  vindex %= 3;
+void Motor::updateEncoder() {
+  int32_t new_count = quadrature_encoder_get_count(pio, sm);
 
-  currentRPM =
-      60000000.0 / (MOTOR_CEPR / 4 * (difs[0] + difs[1] + difs[2]) / 3);
+  // Change in position
+  int32_t delta = new_count - last_encoder_count;
+  last_encoder_count = new_count;
 
-  if (currentDir) {
-    currentPosition += 1;
-  } else {
-    currentPosition -= 1;
-    currentRPM *= -1;
+  currentPosition = new_count;
+
+  absolute_time_t current_time = get_absolute_time();
+  int64_t time_diff_us = absolute_time_diff_us(last_rpm_time, current_time);
+
+  // Update RPM after 50ms minimum difference between last and current time
+  if (time_diff_us > 50000) {
+    currentRPM = (delta * 60000000.0f) / (MOTOR_CEPR * time_diff_us);
+    last_rpm_time = current_time;
   }
-}
 
-void Motor::clockInterruptTime() {
-  /*
-      Used in a clock interrupt callback to set the RPM to 0 if the GPIO
-      interrupt hasn't been triggered after a set amount of time.
-  */
-  if (absolute_time_diff_us(lastTime, get_absolute_time()) > 10000) {
+  if (time_diff_us > 500000 && delta == 0) {
     currentRPM = 0;
   }
 }
 
 void Motor::updatePWM() {
-  /*
-      Used in a clock interrupt callback to set RPM values of motors based on a
-     PI loop. A feedforward value is used to decrease the time needed for the
-     motor to hit the target RPM after turning on.
-  */
+  updateEncoder();
+
   if (!motorOn) {
-  } else {
-    absolute_time_t pidCurrentTime = get_absolute_time();
-    float error = abs(targetRPM) - abs(currentRPM);
-    integral += error * (absolute_time_diff_us(lastPIDTime, pidCurrentTime) /
-                         60000000.0);
-    if (integral > 100) {
-      integral = 100;
-    }
-    float feedForward = 537 + 0.8 * abs(targetRPM); // for vbatt of 7.6V
-    float pwm = kp * error + ki * integral + feedForward;
-    if (pwm > 999) {
-      pwm = 999;
-    }
-    if (targetRPM >
-        0) { // We should find a way to condense these if statements.
-      pwm_set_chan_level(slice, channel1, pwm);
-      pwm_set_chan_level(slice, channel2, 0);
-    } else {
-      pwm_set_chan_level(slice, channel1, 0);
-      pwm_set_chan_level(slice, channel2, pwm);
-    }
-    lastPIDTime = pidCurrentTime;
+    return;
   }
+
+  absolute_time_t pidCurrentTime = get_absolute_time();
+  // PI Control Loop for motor speed
+  float error = abs(targetRPM) - abs(currentRPM);
+  integral += error * (absolute_time_diff_us(lastPIDTime, pidCurrentTime) /
+                       60000000.0f);
+  // Deadband
+  if (integral > 100) {
+    integral = 100;
+  }
+
+  // Calculate PWM with feedforward value
+  float feedForward = 537 + 0.8f * abs(targetRPM); // for vbatt of 7.6V
+  float pwm = kp * error + ki * integral + feedForward;
+
+  // Deadband
+  if (pwm > 999) {
+    pwm = 999;
+  }
+
+  // Set direction based on target RPM sign
+  if (targetRPM > 0) { // We should find a way to condense these if statements.
+    pwm_set_chan_level(slice, channel1, pwm);
+    pwm_set_chan_level(slice, channel2, 0);
+  } else {
+    pwm_set_chan_level(slice, channel1, 0);
+    pwm_set_chan_level(slice, channel2, pwm);
+  }
+
+  lastPIDTime = pidCurrentTime;
 }
 
 // Test program

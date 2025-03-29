@@ -34,16 +34,15 @@ add_executable(
         Drivetrain.h
         Motor.h
         Motor.cpp
-        encoders.cpp
-        encoders.h
+        encoder.cpp
+        encoder.h
     )
 
 pico_add_extra_outputs(main)
 
-# pull in common dependencies
-target_link_libraries(main pico_stdlib hardware_gpio hardware_pwm hardware_irq encoder_pio harward_timer hardware_clocks)
+# Pull in common dependencies
+target_link_libraries(main pico_stdlib hardware_gpio hardware_pwm hardware_pio hardware_irq hardware_timer hardware_clocks)
 
-# enable serial
+# Enable serial
 pico_enable_stdio_usb(main 1)
 pico_enable_stdio_uart(main 0)
-
